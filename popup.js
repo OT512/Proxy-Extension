@@ -641,7 +641,7 @@ document.addEventListener('DOMContentLoaded', () => {
                         console.error('Fetch error:', errorMsg);
                         // 提供更友好的错误提示
                         if (errorMsg.includes('Failed to fetch') || errorMsg.includes('NetworkError')) {
-                            reject(new Error('网络无法访问，请确保代理已启用或使用可直连的规则URL'));
+                            reject(new Error('网络无法访问，请确保代理已启用并工作在 [全局] 模式或使用可直连的规则URL'));
                         } else {
                             reject(new Error(errorMsg));
                         }
