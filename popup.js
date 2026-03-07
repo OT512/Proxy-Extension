@@ -820,7 +820,7 @@ document.addEventListener('DOMContentLoaded', () => {
         updateNotice.title = `点击下载新版本 v${updateInfo.latestVersion}`;
 
         updateNotice.onclick = () => {
-            chrome.tabs.create({ url: `https://github.com/boy86001/OT512-Proxy-Extension/releases` });
+            chrome.tabs.create({ url: `https://github.com/OT512/Proxy-Extension/releases` });
         };
     }
 });
