@@ -2,7 +2,7 @@
 
 // Version information
 const EXTENSION_VERSION = '1.0.0';
-const GITHUB_REPO = 'boy86001/OT512-Proxy-Extension';
+const GITHUB_REPO = 'OT512/Proxy-Extension';
 const VERSION_CHECK_URL = `https://raw.githubusercontent.com/${GITHUB_REPO}/main/manifest.json`;
 const RELEASES_URL = `https://github.com/${GITHUB_REPO}/releases`;
 
