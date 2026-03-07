@@ -629,7 +629,7 @@ document.addEventListener('DOMContentLoaded', () => {
                 (response) => {
                     if (chrome.runtime.lastError) {
                         console.error('Runtime error:', chrome.runtime.lastError);
-                        reject(new Error(chrome.runtime.lastError.message));
+                        reject(new Error('扩展服务未响应，请重试'));
                         return;
                     }
 
@@ -637,9 +637,14 @@ document.addEventListener('DOMContentLoaded', () => {
                         console.log('Fetched rules count:', response.count);
                         resolve(response.rules);
                     } else {
-                        const errorMsg = response?.error || 'Failed to fetch rules';
+                        const errorMsg = response?.error || '获取规则失败';
                         console.error('Fetch error:', errorMsg);
-                        reject(new Error(errorMsg));
+                        // 提供更友好的错误提示
+                        if (errorMsg.includes('Failed to fetch') || errorMsg.includes('NetworkError')) {
+                            reject(new Error('网络无法访问，请确保代理已启用或使用可直连的规则URL'));
+                        } else {
+                            reject(new Error(errorMsg));
+                        }
                     }
                 }
             );
