@@ -2,9 +2,7 @@
 
 document.addEventListener('DOMContentLoaded', () => {
     // 元素引用
-    const enableToggle = document.getElementById('enableToggle');
-    const statusDot = document.getElementById('statusDot');
-    const statusText = document.getElementById('statusText');
+    const enableToggleHeader = document.getElementById('enableToggleHeader');
     const tabs = document.querySelectorAll('.tab');
     const panels = document.querySelectorAll('.panel');
     const modeOptions = document.querySelectorAll('.mode-option');
@@ -111,7 +109,7 @@ document.addEventListener('DOMContentLoaded', () => {
 
     function updateUI() {
         updateStatus(config.enabled);
-        enableToggle.checked = config.enabled;
+        enableToggleHeader.checked = config.enabled;
         modeOptions.forEach(opt => {
             opt.classList.toggle('active', opt.dataset.mode === config.proxyMode);
         });
@@ -119,16 +117,17 @@ document.addEventListener('DOMContentLoaded', () => {
         renderCurrentServer();
         updateRulesInfo();
         renderRuleSources();
+
+        // Hide loading overlay after UI is ready
+        const loadingOverlay = document.getElementById('loadingOverlay');
+        if (loadingOverlay) {
+            loadingOverlay.style.display = 'none';
+        }
     }
 
     function updateStatus(enabled) {
-        if (enabled) {
-            statusDot.classList.add('active');
-            statusText.textContent = '已连接';
-        } else {
-            statusDot.classList.remove('active');
-            statusText.textContent = '已断开';
-        }
+        // Status is now shown via the toggle switch in header
+        // No separate status dot/text needed
     }
 
     // 标签切换
@@ -142,8 +141,8 @@ document.addEventListener('DOMContentLoaded', () => {
     });
 
     // 启用/禁用代理
-    enableToggle.addEventListener('change', () => {
-        config.enabled = enableToggle.checked;
+    enableToggleHeader.addEventListener('change', () => {
+        config.enabled = enableToggleHeader.checked;
         updateStatus(config.enabled);
         saveConfig();
     });
@@ -158,6 +157,9 @@ document.addEventListener('DOMContentLoaded', () => {
         });
     });
 
+    // 服务器状态缓存
+    const serverStatusCache = {};
+
     // 渲染服务器列表
     function renderServerList() {
         serverList.innerHTML = '';
@@ -167,12 +169,14 @@ document.addEventListener('DOMContentLoaded', () => {
             item.innerHTML = `
                 <div class="radio"></div>
                 <div class="server-info">
-                    <div class="server-name">${server.name}</div>
-                    <div class="server-detail">${server.type.toUpperCase()} - ${server.host}:${server.port}</div>
+                    <div class="server-name">${server.name}<span class="test-result" style="display:none;"></span></div>
+                    <div class="server-detail">${server.type.toUpperCase()} - ${server.host}</div>
+                    <div class="test-progress"></div>
                 </div>
                 <div class="server-actions">
-                    <button class="btn-icon edit" data-id="${server.id}">✎</button>
-                    <button class="btn-icon delete" data-id="${server.id}">✕</button>
+                    <button class="btn-icon test" data-id="${server.id}" title="测试连接">⚡</button>
+                    <button class="btn-icon edit" data-id="${server.id}" title="编辑">✎</button>
+                    <button class="btn-icon delete" data-id="${server.id}" title="删除">✕</button>
                 </div>
             `;
 
@@ -207,21 +211,140 @@ document.addEventListener('DOMContentLoaded', () => {
                 }
             });
 
+            // 测试按钮点击事件
+            item.querySelector('.test').addEventListener('click', async (e) => {
+                e.stopPropagation();
+                await testServer(server, item);
+            });
+
             serverList.appendChild(item);
         });
+
+        // 绑定测试按钮事件（使用事件委托）
+        serverList.querySelectorAll('.btn-icon.test').forEach(btn => {
+            btn.addEventListener('click', async (e) => {
+                e.stopPropagation();
+                const serverId = parseInt(btn.dataset.id);
+                const server = config.servers.find(s => s.id === serverId);
+                const item = btn.closest('.server-item');
+                if (server && item) {
+                    await testServer(server, item);
+                }
+            });
+        });
+    }
+
+    // 测试服务器连接
+    async function testServer(server, item) {
+        const testBtn = item.querySelector('.btn-icon.test');
+        const testResult = item.querySelector('.test-result');
+        const testProgress = item.querySelector('.test-progress');
+
+        // 检查是否是当前服务器行（没有测试按钮）
+        const isCurrentServerRow = !testBtn;
+
+        // 重置状态
+        item.classList.remove('test-success', 'test-fail');
+        item.classList.add('testing');
+        if (testResult) testResult.style.display = 'none';
+        if (testBtn) {
+            testBtn.disabled = true;
+            testBtn.textContent = '...';
+        }
+
+        const startTime = Date.now();
+        let testSuccess = false;
+        let testLatency = null;
+        let testError = null;
+
+        try {
+            // 发送测试请求到 background
+            const response = await new Promise((resolve, reject) => {
+                chrome.runtime.sendMessage(
+                    { action: 'testServer', server: server },
+                    (res) => {
+                        if (chrome.runtime.lastError) {
+                            reject(new Error(chrome.runtime.lastError.message));
+                        } else {
+                            resolve(res);
+                        }
+                    }
+                );
+            });
+
+            testLatency = Date.now() - startTime;
+
+            if (response && response.success) {
+                testSuccess = true;
+                serverStatusCache[server.id] = { status: 'success', latency: testLatency };
+            } else {
+                throw new Error(response?.error || '连接失败');
+            }
+        } catch (error) {
+            testSuccess = false;
+            testError = error.message;
+            serverStatusCache[server.id] = { status: 'fail', latency: null };
+        }
+
+        // 等待进度条动画完成（2秒）再显示结果
+        const elapsed = Date.now() - startTime;
+        const animationDuration = 2000;
+        const remainingTime = Math.max(0, animationDuration - elapsed);
+
+        await new Promise(resolve => setTimeout(resolve, remainingTime));
+
+        // 显示结果
+        item.classList.remove('testing');
+
+        if (testSuccess) {
+            item.classList.add('test-success');
+            if (testResult) {
+                testResult.textContent = `${testLatency}ms`;
+                testResult.className = 'test-result success';
+                testResult.style.display = 'inline';
+            }
+            showToast(`${server.name} 连接成功 (${testLatency}ms)`, 'success');
+        } else {
+            item.classList.add('test-fail');
+            if (testResult) {
+                testResult.textContent = '失败';
+                testResult.className = 'test-result fail';
+                testResult.style.display = 'inline';
+            }
+            showToast(`${server.name} 连接失败: ${testError}`, 'error');
+        }
+
+        // 恢复按钮状态
+        if (testBtn) {
+            testBtn.disabled = false;
+            testBtn.textContent = '⚡';
+        }
     }
 
     // 渲染当前服务器
     function renderCurrentServer() {
         const server = config.servers.find(s => s.id === config.activeServerId);
         if (server) {
+            const status = serverStatusCache[server.id] || { status: 'unknown', latency: null };
+            const latencyText = status.latency ? `${status.latency}ms` : '';
+
             currentServerDiv.innerHTML = `
-                <div class="server-item active">
+                <div class="server-item active" style="cursor: pointer; position: relative;">
                     <div class="server-info">
                         <div class="server-name">${server.name}</div>
+                        <div class="test-progress"></div>
+                    </div>
+                    <div class="server-actions">
+                        <span class="test-result" style="display: ${latencyText ? 'inline' : 'none'};">${latencyText}</span>
                     </div>
                 </div>
             `;
+
+            // 点击当前服务器行时重新测试连接
+            currentServerDiv.querySelector('.server-item').addEventListener('click', async () => {
+                const item = currentServerDiv.querySelector('.server-item');
+                await testServer(server, item);
+            });
         }
     }
 
@@ -240,22 +363,37 @@ document.addEventListener('DOMContentLoaded', () => {
         document.getElementById('serverName').value = server.name;
         document.getElementById('serverType').value = server.type;
         document.getElementById('serverHost').value = server.host;
-        document.getElementById('serverPort').value = server.port;
         document.getElementById('serverUsername').value = server.username || '';
         document.getElementById('serverPassword').value = server.password || '';
         serverModal.classList.add('show');
     }
 
     closeModal.addEventListener('click', () => serverModal.classList.remove('show'));
-    serverModal.addEventListener('click', (e) => {
-        if (e.target === serverModal) serverModal.classList.remove('show');
-    });
+
+    // Prevent clicks on modal background from closing the popup
+    serverModal.addEventListener('mousedown', (e) => {
+        if (e.target === serverModal) {
+            e.preventDefault();
+            e.stopPropagation();
+        }
+    }, true);
+    serverModal.addEventListener('mouseup', (e) => {
+        if (e.target === serverModal) {
+            e.preventDefault();
+            e.stopPropagation();
+        }
+    }, true);
+    serverModal.addEventListener('contextmenu', (e) => {
+        if (e.target === serverModal) {
+            e.preventDefault();
+            e.stopPropagation();
+        }
+    }, true);
 
     function clearServerForm() {
         document.getElementById('serverName').value = '';
         document.getElementById('serverType').value = 'https';
         document.getElementById('serverHost').value = '';
-        document.getElementById('serverPort').value = '';
         document.getElementById('serverUsername').value = '';
         document.getElementById('serverPassword').value = '';
     }
@@ -265,12 +403,11 @@ document.addEventListener('DOMContentLoaded', () => {
         const name = document.getElementById('serverName').value.trim();
         const type = document.getElementById('serverType').value;
         const host = document.getElementById('serverHost').value.trim();
-        const port = parseInt(document.getElementById('serverPort').value);
         const username = document.getElementById('serverUsername').value.trim();
         const password = document.getElementById('serverPassword').value;
 
-        if (!name || !host || !port) {
-            showToast('请填写服务器名称、地址和端口', 'error');
+        if (!name || !host) {
+            showToast('请填写服务器名称和地址', 'error');
             return;
         }
 
@@ -280,13 +417,14 @@ document.addEventListener('DOMContentLoaded', () => {
                 server.name = name;
                 server.type = type;
                 server.host = host;
-                server.port = port;
                 server.username = username;
                 server.password = password;
+                // Port is managed automatically (443/8443 switching)
             }
         } else {
             const newId = Math.max(...config.servers.map(s => s.id), 0) + 1;
-            config.servers.push({ id: newId, name, type, host, port, username, password });
+            // Default port is 443, will be switched automatically when credentials change
+            config.servers.push({ id: newId, name, type, host, port: 443, username, password });
             config.activeServerId = newId;
         }
 
@@ -410,9 +548,9 @@ document.addEventListener('DOMContentLoaded', () => {
         editingRuleSourceId = source.id;
         importedRules = null;
         ruleSourceModalTitle.textContent = '编辑规则源';
-        document.getElementById('ruleSourceName').value = source.name;
+        document.getElementById('ruleSourceName').value = source.name || '';
         document.getElementById('ruleSourceType').value = source.ruleType || 'proxy';
-        document.getElementById('ruleSourceUrl').value = source.url;
+        document.getElementById('ruleSourceUrl').value = source.url || '';
         document.getElementById('ruleSourceDesc').value = source.desc || '';
         importStatus.textContent = source.rules ? `已导入 ${source.rules.length} 条规则` : '';
         importStatus.style.color = '#888';
@@ -421,17 +559,25 @@ document.addEventListener('DOMContentLoaded', () => {
 
     closeRuleSourceModal.addEventListener('click', () => ruleSourceModal.classList.remove('show'));
 
-    // Only close modal when mousedown starts on the modal background (not when dragging from inside)
-    let mouseDownTarget = null;
+    // Prevent clicks on modal background from closing the popup
     ruleSourceModal.addEventListener('mousedown', (e) => {
-        mouseDownTarget = e.target;
-    });
-    ruleSourceModal.addEventListener('mouseup', (e) => {
-        if (mouseDownTarget === ruleSourceModal && e.target === ruleSourceModal) {
-            ruleSourceModal.classList.remove('show');
+        if (e.target === ruleSourceModal) {
+            e.preventDefault();
+            e.stopPropagation();
         }
-        mouseDownTarget = null;
-    });
+    }, true);
+    ruleSourceModal.addEventListener('mouseup', (e) => {
+        if (e.target === ruleSourceModal) {
+            e.preventDefault();
+            e.stopPropagation();
+        }
+    }, true);
+    ruleSourceModal.addEventListener('contextmenu', (e) => {
+        if (e.target === ruleSourceModal) {
+            e.preventDefault();
+            e.stopPropagation();
+        }
+    }, true);
 
     // 导入规则
     importRuleSourceBtn.addEventListener('click', async () => {
@@ -633,4 +779,43 @@ document.addEventListener('DOMContentLoaded', () => {
             showToast('规则已清除', 'success');
         }
     });
+
+    // Version check and update notification
+    const versionInfo = document.getElementById('versionInfo');
+    const updateNotice = document.getElementById('updateNotice');
+
+    // Get version from background
+    chrome.runtime.sendMessage({ action: 'getVersion' }, (response) => {
+        if (response && response.version) {
+            versionInfo.textContent = `OT512 Proxy v${response.version}`;
+        }
+    });
+
+    // Check for update availability
+    chrome.storage.local.get(['updateAvailable'], (result) => {
+        if (result.updateAvailable) {
+            showUpdateNotice(result.updateAvailable);
+        }
+    });
+
+    // Listen for storage changes (update notification)
+    chrome.storage.onChanged.addListener((changes, namespace) => {
+        if (namespace === 'local' && changes.updateAvailable) {
+            if (changes.updateAvailable.newValue) {
+                showUpdateNotice(changes.updateAvailable.newValue);
+            } else {
+                updateNotice.style.display = 'none';
+            }
+        }
+    });
+
+    function showUpdateNotice(updateInfo) {
+        updateNotice.style.display = 'inline';
+        updateNotice.textContent = `🔄 v${updateInfo.latestVersion}`;
+        updateNotice.title = `点击下载新版本 v${updateInfo.latestVersion}`;
+
+        updateNotice.onclick = () => {
+            chrome.tabs.create({ url: `https://github.com/boy86001/OT512-Proxy-Extension/releases` });
+        };
+    }
 });

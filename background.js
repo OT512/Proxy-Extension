@@ -1,111 +1,83 @@
 // JP Proxy - Background Service Worker
 
-// 内存缓存，避免 onAuthRequired 异步读取超时
+// Version information
+const EXTENSION_VERSION = '1.0.0';
+const GITHUB_REPO = 'boy86001/OT512-Proxy-Extension';
+const VERSION_CHECK_URL = `https://raw.githubusercontent.com/${GITHUB_REPO}/main/manifest.json`;
+const RELEASES_URL = `https://github.com/${GITHUB_REPO}/releases`;
+
+// Memory cache for sync return in onAuthRequired
 let cachedConfig = null;
 
-const DEFAULT_CONFIG = {
-    enabled: false,
-    servers: [{
-        id: 1,
-        name: 'Proxy Server',
-        type: 'https',
-        host: 'your-proxy-domain.com',
-        port: 443,
-        username: 'YOUR_USERNAME',
-        password: 'YOUR_PASSWORD'
-    }],
-    activeServerId: 1,
-    proxyMode: 'rules',
-    rules: [],
-    lastUpdate: null,
-    ruleSources: []
+// Pre-compiled regex for URL rule parsing
+const RE_URL_RULE = /\|https?:\/\/([^\/\|]+)/;
+
+// PAC script cache
+let cachedPacScript = null;
+let cachedPacRuleHash = null;
+
+// Default config factory
+function createDefaultConfig() {
+    return {
+        enabled: false,
+        servers: [],
+        activeServerId: null,
+        proxyMode: 'rules',
+        rules: [],
+        lastUpdate: null,
+        ruleSources: []
+    };
+}
+
+// Unified storage wrapper
+const Storage = {
+    async getConfig() {
+        const result = await chrome.storage.local.get(['config']);
+        return result.config || createDefaultConfig();
+    },
+    async setConfig(config) {
+        cachedConfig = config;
+        return chrome.storage.local.set({ config });
+    }
 };
 
 const RULES_URL = 'https://cdn.jsdelivr.net/gh/boy86001/SmartProxy-Tools@main/gfwlist.txt';
 
 // 初始化
-chrome.runtime.onInstalled.addListener(() => {
+chrome.runtime.onInstalled.addListener((details) => {
+    console.log('onInstalled triggered, reason:', details.reason);
+
     chrome.storage.local.get(['config'], (result) => {
+        console.log('Storage config exists:', !!result.config);
+        console.log('Storage config:', JSON.stringify(result.config, null, 2));
+
         if (!result.config) {
-            const config = { ...DEFAULT_CONFIG };
-            // 首次安装：先开启全局代理以便下载规则
-            config.enabled = true;
-            config.proxyMode = 'all';
+            // 首次安装：创建默认配置，不自动下载规则
+            // 用户需要先添加服务器，然后手动导入规则
+            console.log('Creating default config...');
+            const config = createDefaultConfig();
+            config.enabled = false;
+            config.proxyMode = 'rules';
             chrome.storage.local.set({ config }, () => {
-                console.log('First install: enabling global proxy to fetch rules...');
+                console.log('First install: created default config, waiting for user to add server...');
                 updateProxy(config);
-                // 延迟下载规则（等待代理生效）
-                setTimeout(() => fetchAndSaveRules(), 1000);
             });
         } else {
-            // 检查是否需要更新规则
-            if (!result.config.ruleSources || result.config.ruleSources.length === 0) {
-                // 如果已有配置但没有规则，先开启全局代理
-                const config = result.config;
-                config.enabled = true;
-                config.proxyMode = 'all';
-                chrome.storage.local.set({ config }, () => {
-                    updateProxy(config);
-                    setTimeout(() => fetchAndSaveRules(), 1000);
-                });
-            }
+            console.log('Config already exists, skipping initialization');
         }
     });
 });
 
-// 自动下载并保存规则
+// Auto-fetch and save rules
 async function fetchAndSaveRules() {
     console.log('Auto-fetching rules from:', RULES_URL);
     try {
-        const response = await fetch(RULES_URL);
-        if (!response.ok) {
-            throw new Error(`HTTP ${response.status}`);
-        }
-        const text = await response.text();
-        const rules = parseRules(text);
-        console.log('Auto-fetched rules:', rules.length);
-
-        chrome.storage.local.get(['config'], (result) => {
-            const config = result.config || DEFAULT_CONFIG;
-            config.ruleSources = [{
-                id: 'gfwlist',
-                name: 'GFWList',
-                ruleType: 'proxy',
-                enabled: true,
-                rules: rules,
-                lastUpdate: new Date().toISOString()
-            }];
-            config.lastUpdate = new Date().toISOString();
-            // 规则下载完成后切换到智能模式
-            config.proxyMode = 'rules';
-            chrome.storage.local.set({ config }, () => {
-                console.log('Rules saved, switching to rules mode...');
-                updateProxy(config);
-            });
-        });
+        await doFetchAndSave();
     } catch (error) {
-        console.error('Auto-fetch rules failed:', error);
-        // Retry after 60 seconds, then switch to rules mode if still fails
+        console.error('Auto-fetch rules failed, retrying in 60s:', error);
         setTimeout(async () => {
             try {
-                const response = await fetch(RULES_URL);
-                if (!response.ok) throw new Error(`HTTP ${response.status}`);
-                const text = await response.text();
-                const rules = parseRules(text);
-
-                chrome.storage.local.get(['config'], (result) => {
-                    const config = result.config || DEFAULT_CONFIG;
-                    config.ruleSources = [{
-                        id: 'gfwlist',
-                        name: 'GFWList',
-                        ruleType: 'proxy',
-                        enabled: true,
-                        rules: rules,
-                        lastUpdate: new Date().toISOString()
-                    }];
-                    config.proxyMode = 'rules';
-                    chrome.storage.local.set({ config }, () => updateProxy(config));
-                });
+                await doFetchAndSave();
             } catch (retryError) {
                 console.error('Retry failed, switching to rules mode:', retryError);
                 chrome.storage.local.get(['config'], (result) => {
@@ -120,13 +92,109 @@ async function fetchAndSaveRules() {
     }
 }
 
-// 监听配置变化
+// Internal function to fetch and save rules
+async function doFetchAndSave() {
+    const response = await fetch(RULES_URL);
+    if (!response.ok) throw new Error(`HTTP ${response.status}`);
+    const text = await response.text();
+    const rules = parseRules(text);
+    console.log('Fetched rules:', rules.length);
+
+    return new Promise((resolve) => {
+        chrome.storage.local.get(['config'], (result) => {
+            const config = result.config || createDefaultConfig();
+            config.ruleSources = [{
+                id: 'gfwlist',
+                name: 'GFWList',
+                ruleType: 'proxy',
+                enabled: true,
+                rules: rules,
+                lastUpdate: new Date().toISOString()
+            }];
+            config.lastUpdate = new Date().toISOString();
+            config.proxyMode = 'rules';
+            chrome.storage.local.set({ config }, () => {
+                console.log('Rules saved, switching to rules mode...');
+                updateProxy(config);
+                resolve();
+            });
+        });
+    });
+}
+
+// Listen for config changes
 chrome.storage.onChanged.addListener((changes, namespace) => {
     if (namespace === 'local' && changes.config) {
-        cachedConfig = changes.config.newValue; // 同步更新内存缓存
-        updateProxy(cachedConfig);
+        const newConfig = changes.config.newValue;
+        const oldConfig = changes.config.oldValue;
+
+        cachedConfig = newConfig; // Sync memory cache first
+
+        // Check if credentials changed
+        if (oldConfig) {
+            const newServer = newConfig.servers.find(s => s.id === newConfig.activeServerId);
+            const oldServer = oldConfig.servers.find(s => s.id === oldConfig.activeServerId);
+
+            if (newServer && oldServer && (
+                newServer.username !== oldServer.username ||
+                newServer.password !== oldServer.password
+            )) {
+                console.log('Credential changed:', oldServer.username, '->', newServer.username);
+                // Credentials changed, force re-authentication
+                forceReauth(newConfig);
+                return;
+            }
+        }
+
+        // Normal config change, just update proxy
+        updateProxy(newConfig);
     }
 });
+
+// Force re-authentication by switching port to bypass browser auth cache
+// Browser caches auth credentials by (host:port, realm), changing port forces new auth
+const PORT_PRIMARY = 443;
+const PORT_BACKUP = 8443;
+
+function forceReauth(config) {
+    console.log('forceReauth: switching port to bypass browser auth cache...');
+
+    const server = config.servers.find(s => s.id === config.activeServerId) || config.servers[0];
+    if (!server) {
+        console.error('No active server for forceReauth');
+        updateProxy(config);
+        return;
+    }
+
+    // Determine current port and switch to the other one
+    const currentPort = server.port;
+    const newPort = currentPort === PORT_PRIMARY ? PORT_BACKUP : PORT_PRIMARY;
+
+    console.log('Switching port:', currentPort, '->', newPort);
+
+    // Update server port
+    server.port = newPort;
+
+    // Clear PAC cache since port changed
+    cachedPacScript = null;
+    cachedPacRuleHash = null;
+
+    // First set direct mode to clear proxy state
+    chrome.proxy.settings.set({
+        value: { mode: 'direct' },
+        scope: 'regular'
+    }, () => {
+        // Save config with new port
+        chrome.storage.local.set({ config }, () => {
+            console.log('Config saved with new port:', newPort);
+            // Update proxy with new port
+            updateProxy(config);
+        });
+    });
+}
+
+// Timestamp for PAC script cache busting
+let authRefreshTimestamp = Date.now();
 
 // 获取当前服务器
 function getActiveServer(config) {
@@ -137,13 +205,15 @@ function getActiveServer(config) {
 function updateProxy(config) {
     console.log('updateProxy called, mode:', config.proxyMode, 'enabled:', config.enabled);
 
+    // Always update badge based on enabled state
+    updateBadge(config.enabled);
+
     if (!config.enabled || config.servers.length === 0) {
         chrome.proxy.settings.set({
             value: { mode: 'direct' },
             scope: 'regular'
         }, () => {
             console.log('Proxy disabled');
-            updateBadge(false);
         });
         return;
     }
@@ -196,12 +266,22 @@ function updateProxy(config) {
     }
 }
 
-// 生成 PAC 脚本（简化版本 - 使用正则表达式）
+// Generate PAC script with caching
 function generatePacScript(config, server) {
+    // Build a simple hash of rules to detect changes
+    const ruleHash = (config.ruleSources?.map(s => s.lastUpdate).join(',') || '') +
+        server.host + ':' + server.port + ':' + server.type;
+
+    // Return cached version if available and unchanged
+    if (cachedPacScript && cachedPacRuleHash === ruleHash) {
+        console.log('Using cached PAC script');
+        return cachedPacScript;
+    }
+
+    console.log('Generating new PAC script...');
+
     let proxyRules = [];
     let directRules = [];
-
-    console.log('generatePacScript called');
 
     if (config.ruleSources) {
         config.ruleSources.forEach(source => {
@@ -222,7 +302,7 @@ function generatePacScript(config, server) {
     console.log('Total proxyRules:', proxyRules.length);
     console.log('Total directRules:', directRules.length);
 
-    // 构建域名后缀数组
+    // Build domain array
     const proxyDomains = [];
     for (const rule of proxyRules) {
         if (rule.startsWith('||')) {
@@ -238,49 +318,86 @@ function generatePacScript(config, server) {
         ? `SOCKS5 ${server.host}:${server.port}`
         : `${server.type.toUpperCase()} ${server.host}:${server.port}`;
 
-    // 生成简化的 PAC 脚本
-    return `
-var proxyDomains = ${JSON.stringify(proxyDomains)};
+    // Generate optimized PAC script with hash-based domain lookup
+    const script = `
+// Timestamp: ${authRefreshTimestamp}
+var proxyMap = ${JSON.stringify(Object.fromEntries(proxyDomains.map(d => [d, true])))};
 var proxyStr = '${proxyStr}';
 
 function FindProxyForURL(url, host) {
+    // Exclude browser extension URLs
+    if (url.startsWith('chrome-extension://') || 
+        url.startsWith('ms-browser-extension://') ||
+        url.startsWith('edge-extension://')) {
+        return 'DIRECT';
+    }
+
     host = host.toLowerCase();
     
-    // Local addresses - direct connection
-    if (host === 'localhost' || host === '127.0.0.1' || host.startsWith('192.168.') || host.startsWith('10.') || host.startsWith('172.16.')) {
+    // Local direct
+    if (host === 'localhost' || host === '127.0.0.1' ||
+        host.startsWith('192.168.') || host.startsWith('10.') || 
+        host.startsWith('172.16.')) {
         return 'DIRECT';
     }
     
-    // Check domain suffix match
-    for (var i = 0; i < proxyDomains.length; i++) {
-        var domain = proxyDomains[i];
-        if (host === domain || host.endsWith('.' + domain)) {
-            return proxyStr;
-        }
+    // Check host itself and each parent domain (O(domain levels) instead of O(n))
+    var parts = host.split('.');
+    for (var i = 0; i < parts.length - 1; i++) {
+        var candidate = parts.slice(i).join('.');
+        if (proxyMap[candidate]) return proxyStr;
     }
     
     return 'DIRECT';
 }
 `;
+
+    // Cache the result
+    cachedPacScript = script;
+    cachedPacRuleHash = ruleHash;
+
+    return script;
 }
 
-// 更新徽章
+// Update toolbar icon based on enabled state
 function updateBadge(enabled) {
-    if (enabled) {
-        chrome.action.setBadgeText({ text: 'ON' });
-        chrome.action.setBadgeBackgroundColor({ color: '#4CAF50' });
-    } else {
-        chrome.action.setBadgeText({ text: 'OFF' });
-        chrome.action.setBadgeBackgroundColor({ color: '#9E9E9E' });
-    }
+    // Clear badge (no status indicator)
+    chrome.action.setBadgeText({ text: '' });
+
+    // Switch icon based on enabled state
+    // - on: enabled state (green/active look)
+    // - off: disabled state (gray/inactive look)
+    const iconPath = enabled ? {
+        16: 'icons/icon16-on.png',
+        48: 'icons/icon48-on.png',
+        128: 'icons/icon128-on.png'
+    } : {
+        16: 'icons/icon16-off.png',
+        48: 'icons/icon48-off.png',
+        128: 'icons/icon128-off.png'
+    };
+    chrome.action.setIcon({ path: iconPath });
 }
 
-// Handle proxy auth - 使用内存缓存同步返回，避免异步超时
+// Handle proxy auth - async to handle SW wake-up (cachedConfig may be null)
 chrome.webRequest.onAuthRequired.addListener(
-    (details) => {
-        if (cachedConfig && cachedConfig.servers) {
-            const server = cachedConfig.servers.find(s => s.id === cachedConfig.activeServerId) || cachedConfig.servers[0];
+    async (details) => {
+        console.log('onAuthRequired called for:', details.url);
+
+        // Try memory cache first
+        let config = cachedConfig;
+
+        // If cache is empty (SW woke up), read from storage
+        if (!config) {
+            console.log('Cache miss, reading from storage...');
+            config = await Storage.getConfig();
+            cachedConfig = config; // Repopulate cache
+        }
+
+        if (config && config.servers) {
+            const server = config.servers.find(s => s.id === config.activeServerId) || config.servers[0];
             if (server && server.username) {
+                console.log('Providing auth for user:', server.username);
                 return {
                     authCredentials: {
                         username: server.username,
@@ -289,34 +406,22 @@ chrome.webRequest.onAuthRequired.addListener(
                 };
             }
         }
+        console.log('No auth provided, canceling');
         return { cancel: false };
     },
     { urls: ['<all_urls>'] },
-    ['blocking']
+    ['asyncBlocking']
 );
 
-// Base64 解码函数
+// Note: onBeforeSendHeaders with blocking mode requires webRequestBlocking permission
+// which is not available in MV3 for normal extensions.
+// The onAuthRequired listener with webRequestAuthProvider is the only option.
+// Browser proxy auth cache is handled by the browser, not the extension.
+
+// Base64 decode using native API
 function base64Decode(str) {
     try {
-        const cleanStr = str.replace(/\s/g, '');
-        const chars = 'ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789+/';
-        let result = [];
-        let i = 0;
-
-        while (i < cleanStr.length) {
-            const c1 = chars.indexOf(cleanStr[i++]);
-            const c2 = chars.indexOf(cleanStr[i++]);
-            const c3 = chars.indexOf(cleanStr[i++]);
-            const c4 = chars.indexOf(cleanStr[i++]);
-
-            const bits = (c1 << 18) | (c2 << 12) | (c3 << 6) | c4;
-
-            result.push((bits >> 16) & 0xFF);
-            if (c3 !== 64) result.push((bits >> 8) & 0xFF);
-            if (c4 !== 64) result.push(bits & 0xFF);
-        }
-
-        return new TextDecoder().decode(new Uint8Array(result));
+        return atob(str.replace(/\s/g, ''));
     } catch (e) {
         console.error('Base64 decode error:', e);
         return null;
@@ -346,7 +451,7 @@ function parseRules(text) {
         if (trimmed.startsWith('||')) {
             rules.push(trimmed);
         } else if (trimmed.startsWith('|')) {
-            const match = trimmed.match(/\|https?:\/\/([^\/\|]+)/);
+            const match = trimmed.match(RE_URL_RULE);
             if (match) rules.push('||' + match[1]);
         } else if (trimmed.startsWith('.')) {
             rules.push('*' + trimmed);
@@ -400,21 +505,246 @@ chrome.runtime.onMessage.addListener((message, sender, sendResponse) => {
         return true;
     }
 
+    // 测试服务器连接
+    if (message.action === 'testServer') {
+        testServerConnection(message.server)
+            .then(result => sendResponse(result))
+            .catch(error => sendResponse({ success: false, error: error.message }));
+        return true;
+    }
+
     return false;
 });
 
-// 启动时立即初始化（Service Worker 唤醒时）
+// Test server connection - test direct TCP connection to proxy server
+// Note: Service Worker fetch() does NOT use chrome.proxy.settings
+// So we test by measuring TCP connection time to the proxy server itself
+async function testServerConnection(server) {
+    console.log('Testing server:', server.host + ':' + server.port);
+
+    const startTime = Date.now();
+
+    try {
+        // Test TCP connection to proxy server using WebSocket handshake
+        // This measures the time to establish a connection to the server
+        // For HTTPS proxies, the server will return 400 (doesn't understand WebSocket)
+        // but that means the TCP connection was established successfully
+        const testUrl = `wss://${server.host}:${server.port}/`;
+
+        const result = await new Promise((resolve) => {
+            const ws = new WebSocket(testUrl);
+            let resolved = false;
+            const timeout = setTimeout(() => {
+                if (!resolved) {
+                    resolved = true;
+                    ws.close();
+                    resolve({ success: false, error: 'Timeout' });
+                }
+            }, 10000);
+
+            ws.onopen = () => {
+                // Should not happen for proxy servers, but if it does, success
+                if (!resolved) {
+                    resolved = true;
+                    clearTimeout(timeout);
+                    ws.close();
+                    resolve({ success: true });
+                }
+            };
+
+            ws.onerror = () => {
+                // For HTTPS proxies, this is expected - server doesn't speak WebSocket
+                // But we got a response, which means TCP connection was established
+                if (!resolved) {
+                    resolved = true;
+                    clearTimeout(timeout);
+                    // This is actually success for proxy servers
+                    resolve({ success: true });
+                }
+            };
+
+            ws.onclose = (event) => {
+                // Server closed connection - this is expected for proxy servers
+                // 400 = server doesn't understand WebSocket protocol (but is reachable)
+                // 403 = forbidden (but server is reachable)
+                if (!resolved) {
+                    resolved = true;
+                    clearTimeout(timeout);
+                    // Any close means we connected and got a response
+                    resolve({ success: true });
+                }
+            };
+        });
+
+        const latency = Date.now() - startTime;
+
+        if (result.success) {
+            console.log('Server test success, latency:', latency + 'ms');
+            return { success: true, latency };
+        } else {
+            return result;
+        }
+
+    } catch (error) {
+        const latency = Date.now() - startTime;
+        console.error('Server test error:', error);
+
+        // DNS resolution failed - invalid hostname
+        if (error.message && (
+            error.message.includes('ENOTFOUND') ||
+            error.message.includes('DNS') ||
+            error.message.includes('name resolution')
+        )) {
+            return { success: false, error: 'DNS解析失败' };
+        }
+
+        // Connection refused - server not listening
+        if (error.message && (
+            error.message.includes('ECONNREFUSED') ||
+            error.message.includes('refused')
+        )) {
+            return { success: false, error: '连接被拒绝' };
+        }
+
+        // Timeout
+        if (error.message === 'Timeout') {
+            return { success: false, error: '连接超时' };
+        }
+
+        // For other errors, if we got some response, consider it success
+        if (latency < 5000 && latency > 50) {
+            return { success: true, latency };
+        }
+
+        return { success: false, error: error.message || 'Connection failed' };
+    }
+}
+
+// Initialize on Service Worker wake-up
 function initConfig() {
     chrome.storage.local.get(['config'], (result) => {
-        cachedConfig = result.config || DEFAULT_CONFIG;
+        cachedConfig = result.config || createDefaultConfig();
         updateProxy(cachedConfig);
     });
 }
 
-// 立即执行初始化
+// Execute immediately on script load (covers Service Worker wake-up)
 initConfig();
 
-// 监听 Service Worker 启动
-chrome.runtime.onStartup.addListener(() => {
-    initConfig();
+// Check for updates on startup and periodically
+checkForUpdates();
+setInterval(checkForUpdates, 24 * 60 * 60 * 1000); // Check every 24 hours
+
+// Check for new version on GitHub
+async function checkForUpdates() {
+    try {
+        // First, test if the update URL is reachable (with a short timeout)
+        const testController = new AbortController();
+        const testTimeout = setTimeout(() => testController.abort(), 5000);
+
+        try {
+            const testResponse = await fetch(VERSION_CHECK_URL, {
+                method: 'HEAD',
+                cache: 'no-cache',
+                signal: testController.signal
+            });
+            clearTimeout(testTimeout);
+
+            // If not reachable, silently skip update check
+            if (!testResponse.ok) {
+                console.log('Update server not reachable, skipping update check');
+                return;
+            }
+        } catch (testError) {
+            clearTimeout(testTimeout);
+            // Network error or timeout - silently skip update check
+            console.log('Update server unreachable, skipping update check');
+            return;
+        }
+
+        // Server is reachable, now fetch the actual version info
+        const response = await fetch(VERSION_CHECK_URL, { cache: 'no-cache' });
+        if (!response.ok) return;
+
+        const manifest = await response.json();
+        const latestVersion = manifest.version;
+
+        console.log('Current version:', EXTENSION_VERSION, 'Latest:', latestVersion);
+
+        if (compareVersions(latestVersion, EXTENSION_VERSION) > 0) {
+            console.log('New version available:', latestVersion);
+
+            // Store update info
+            chrome.storage.local.set({
+                updateAvailable: {
+                    currentVersion: EXTENSION_VERSION,
+                    latestVersion: latestVersion,
+                    downloadUrl: RELEASES_URL,
+                    checkedAt: new Date().toISOString()
+                }
+            });
+
+            // Show notification
+            showUpdateNotification(latestVersion);
+        } else {
+            // Clear update info if up to date
+            chrome.storage.local.remove(['updateAvailable']);
+        }
+    } catch (error) {
+        // Silently fail - don't log error for update checks
+        console.log('Update check skipped:', error.message);
+    }
+}
+
+// Compare version strings (returns >0 if a > b, <0 if a < b, 0 if equal)
+function compareVersions(a, b) {
+    const partsA = a.split('.').map(Number);
+    const partsB = b.split('.').map(Number);
+
+    for (let i = 0; i < Math.max(partsA.length, partsB.length); i++) {
+        const partA = partsA[i] || 0;
+        const partB = partsB[i] || 0;
+        if (partA > partB) return 1;
+        if (partA < partB) return -1;
+    }
+    return 0;
+}
+
+// Show update notification
+function showUpdateNotification(version) {
+    chrome.notifications.create({
+        type: 'basic',
+        iconUrl: 'icons/icon128.png',
+        title: 'OT512 Proxy 更新可用',
+        message: `新版本 ${version} 已发布，点击下载`,
+        priority: 2,
+        requireInteraction: true
+    });
+
+    // Open release page on click
+    chrome.notifications.onClicked.addListener(() => {
+        chrome.tabs.create({ url: RELEASES_URL });
+    });
+}
+
+// Listen for checkUpdate message from popup
+chrome.runtime.onMessage.addListener((message, sender, sendResponse) => {
+    if (message.action === 'checkUpdate') {
+        checkForUpdates().then(() => {
+            chrome.storage.local.get(['updateAvailable'], (result) => {
+                sendResponse(result.updateAvailable || null);
+            });
+        });
+        return true;
+    }
+
+    if (message.action === 'getVersion') {
+        sendResponse({
+            version: EXTENSION_VERSION,
+            githubRepo: GITHUB_REPO
+        });
+        return false;
+    }
+
+    return false;
 });

@@ -1,14 +1,16 @@
 {
     "manifest_version": 3,
-    "name": "OT512 Proxy",
+    "name": "OT512 Proxy - Edge浏览器插件",
     "version": "1.0.0",
-    "description": "安全代理插件 - 通过HTTPS加密连接",
+    "description": "OT512 Proxy - Edge浏览器代理插件，通过HTTPS加密连接",
     "permissions": [
         "proxy",
         "storage",
         "background",
         "webRequest",
-        "webRequestAuthProvider"
+        "webRequestAuthProvider",
+        "browsingData",
+        "notifications"
     ],
     "host_permissions": [
         "<all_urls>"
