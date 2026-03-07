@@ -632,12 +632,36 @@ function initConfig() {
 initConfig();
 
 // Check for updates on startup and periodically
-checkForUpdates();
-setInterval(checkForUpdates, 24 * 60 * 60 * 1000); // Check every 24 hours
+// Only check if 24 hours have passed since last check
+async function shouldCheckUpdate() {
+    const result = await chrome.storage.local.get(['lastUpdateCheck']);
+    const lastCheck = result.lastUpdateCheck;
+    if (!lastCheck) return true;
+
+    const hoursSinceLastCheck = (Date.now() - new Date(lastCheck).getTime()) / (1000 * 60 * 60);
+    return hoursSinceLastCheck >= 24;
+}
+
+// Initial check on startup (with 24h throttle)
+shouldCheckUpdate().then(shouldCheck => {
+    if (shouldCheck) {
+        checkForUpdates();
+    } else {
+        console.log('Skipping update check, checked within 24 hours');
+    }
+});
+setInterval(async () => {
+    if (await shouldCheckUpdate()) {
+        checkForUpdates();
+    }
+}, 60 * 60 * 1000); // Check every hour, but only run if 24h passed
 
 // Check for new version on GitHub
 async function checkForUpdates() {
     try {
+        // Record check time
+        await chrome.storage.local.set({ lastUpdateCheck: new Date().toISOString() });
+
         // First, test if the update URL is reachable (with a short timeout)
         const testController = new AbortController();
         const testTimeout = setTimeout(() => testController.abort(), 5000);
