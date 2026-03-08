@@ -69,15 +69,19 @@ document.addEventListener('DOMContentLoaded', () => {
             const cancelBtn = dialog.querySelector('.btn-cancel');
             const okBtn = dialog.querySelector('.btn-ok');
 
+            // Clone and replace buttons to remove any previous listeners
+            const newCancel = cancelBtn.cloneNode(true);
+            const newOk = okBtn.cloneNode(true);
+            cancelBtn.replaceWith(newCancel);
+            okBtn.replaceWith(newOk);
+
             function cleanup(result) {
                 dialog.classList.remove('show');
-                cancelBtn.removeEventListener('click', () => cleanup(false));
-                okBtn.removeEventListener('click', () => cleanup(true));
                 resolve(result);
             }
 
-            cancelBtn.addEventListener('click', () => cleanup(false));
-            okBtn.addEventListener('click', () => cleanup(true));
+            newCancel.addEventListener('click', () => cleanup(false));
+            newOk.addEventListener('click', () => cleanup(true));
         });
     }
 
@@ -118,11 +122,61 @@ document.addEventListener('DOMContentLoaded', () => {
         updateRulesInfo();
         renderRuleSources();
 
+        // 自动检测当前服务器连接状态
+        autoTestCurrentServer();
+
         // Hide loading overlay after UI is ready
         const loadingOverlay = document.getElementById('loadingOverlay');
         if (loadingOverlay) {
             loadingOverlay.style.display = 'none';
         }
+    }
+
+    // 检测服务器连接状态（单次检测）
+    async function testServerConnection(server) {
+        if (!server) return;
+
+        try {
+            const response = await new Promise((resolve, reject) => {
+                chrome.runtime.sendMessage(
+                    { action: 'testServer', server: server },
+                    (res) => {
+                        if (chrome.runtime.lastError) {
+                            reject(new Error(chrome.runtime.lastError.message));
+                        } else {
+                            resolve(res);
+                        }
+                    }
+                );
+            });
+
+            if (response && response.success) {
+                serverStatusCache[server.id] = { status: 'success', latency: response.latency };
+            } else {
+                const errorMsg = response?.error || '';
+                const isAuthFail = errorMsg.includes('407') || errorMsg.includes('auth') || errorMsg.includes('credentials');
+                serverStatusCache[server.id] = { status: isAuthFail ? 'auth-fail' : 'fail', latency: null };
+            }
+        } catch (error) {
+            const errorMsg = error.message || '';
+            const isAuthFail = errorMsg.includes('407') || errorMsg.includes('auth') || errorMsg.includes('credentials');
+            serverStatusCache[server.id] = { status: isAuthFail ? 'auth-fail' : 'fail', latency: null };
+        }
+
+        // 更新当前服务器显示
+        renderCurrentServer();
+    }
+
+    // 自动检测当前服务器连接状态（入口函数）
+    async function autoTestCurrentServer() {
+        const server = config.servers.find(s => s.id === config.activeServerId);
+        if (!server) return;
+
+        // 如果已有状态（成功或失败），不再重复检测
+        if (serverStatusCache[server.id]) return;
+
+        // 执行单次检测
+        await testServerConnection(server);
     }
 
     function updateStatus(enabled) {
@@ -145,6 +199,8 @@ document.addEventListener('DOMContentLoaded', () => {
         config.enabled = enableToggleHeader.checked;
         updateStatus(config.enabled);
         saveConfig();
+        // 更新当前服务器状态显示
+        renderCurrentServer();
     });
 
     // 模式选择
@@ -157,8 +213,31 @@ document.addEventListener('DOMContentLoaded', () => {
         });
     });
 
-    // 服务器状态缓存
+    // 服务器状态缓存  { status: 'success'|'fail'|'auth-fail'|'unknown', latency, connStatus }
     const serverStatusCache = {};
+
+    // 返回状态徽章 HTML（基于服务器认证状态和扩展启用状态）
+    function connStatusBadge(serverId) {
+        // 扩展关闭时显示已断开
+        if (!config.enabled) {
+            return '<span class="conn-status disconnected">已断开</span>';
+        }
+        const s = serverStatusCache[serverId];
+        if (!s) return '<span class="conn-status disconnected">未检测</span>';
+        if (s.status === 'success') return '<span class="conn-status connected">已连接</span>';
+        if (s.status === 'auth-fail') return '<span class="conn-status auth-fail">认证失败</span>';
+        if (s.status === 'fail') return '<span class="conn-status disconnected">连接失败</span>';
+        return '<span class="conn-status disconnected">未检测</span>';
+    }
+
+    // 返回延迟显示 HTML（只显示延迟，与状态无关）
+    function latencyBadge(serverId) {
+        const s = serverStatusCache[serverId];
+        if (s && s.latency) {
+            return `<span class="test-result success" style="display:inline;">${s.latency}ms</span>`;
+        }
+        return '';
+    }
 
     // 渲染服务器列表
     function renderServerList() {
@@ -219,19 +298,6 @@ document.addEventListener('DOMContentLoaded', () => {
 
             serverList.appendChild(item);
         });
-
-        // 绑定测试按钮事件（使用事件委托）
-        serverList.querySelectorAll('.btn-icon.test').forEach(btn => {
-            btn.addEventListener('click', async (e) => {
-                e.stopPropagation();
-                const serverId = parseInt(btn.dataset.id);
-                const server = config.servers.find(s => s.id === serverId);
-                const item = btn.closest('.server-item');
-                if (server && item) {
-                    await testServer(server, item);
-                }
-            });
-        });
     }
 
     // 测试服务器连接
@@ -283,7 +349,9 @@ document.addEventListener('DOMContentLoaded', () => {
         } catch (error) {
             testSuccess = false;
             testError = error.message;
-            serverStatusCache[server.id] = { status: 'fail', latency: null };
+            // Detect auth failure (407 = wrong credentials)
+            const isAuthFail = testError && (testError.includes('407') || testError.includes('auth') || testError.includes('credentials'));
+            serverStatusCache[server.id] = { status: isAuthFail ? 'auth-fail' : 'fail', latency: null };
         }
 
         // 等待进度条动画完成（2秒）再显示结果
@@ -319,30 +387,30 @@ document.addEventListener('DOMContentLoaded', () => {
             testBtn.disabled = false;
             testBtn.textContent = '⚡';
         }
+
+        // Refresh currentServer panel to update connection status badge
+        renderCurrentServer();
     }
 
     // 渲染当前服务器
     function renderCurrentServer() {
         const server = config.servers.find(s => s.id === config.activeServerId);
         if (server) {
-            const status = serverStatusCache[server.id] || { status: 'unknown', latency: null };
-            const latencyText = status.latency ? `${status.latency}ms` : '';
-
             currentServerDiv.innerHTML = `
-                <div class="server-item active" style="cursor: pointer; position: relative;">
+                <div class="server-item active" style="position: relative; cursor: pointer;">
                     <div class="server-info">
-                        <div class="server-name">${server.name}</div>
+                        <div class="server-name">${server.name}${connStatusBadge(server.id)}</div>
                         <div class="test-progress"></div>
                     </div>
                     <div class="server-actions">
-                        <span class="test-result" style="display: ${latencyText ? 'inline' : 'none'};">${latencyText}</span>
+                        ${latencyBadge(server.id)}
                     </div>
                 </div>
             `;
 
-            // 点击当前服务器行时重新测试连接
-            currentServerDiv.querySelector('.server-item').addEventListener('click', async () => {
-                const item = currentServerDiv.querySelector('.server-item');
+            const item = currentServerDiv.querySelector('.server-item');
+            // 点击整个条目触发测速
+            item.addEventListener('click', async () => {
                 await testServer(server, item);
             });
         }
@@ -354,6 +422,8 @@ document.addEventListener('DOMContentLoaded', () => {
         modalTitle.textContent = '添加服务器';
         clearServerForm();
         serverModal.classList.add('show');
+        // 撑开背景高度以适应弹窗
+        document.body.style.minHeight = '520px';
     });
 
     // 打开编辑服务器弹窗
@@ -366,9 +436,15 @@ document.addEventListener('DOMContentLoaded', () => {
         document.getElementById('serverUsername').value = server.username || '';
         document.getElementById('serverPassword').value = server.password || '';
         serverModal.classList.add('show');
+        // 撑开背景高度以适应弹窗
+        document.body.style.minHeight = '520px';
     }
 
-    closeModal.addEventListener('click', () => serverModal.classList.remove('show'));
+    closeModal.addEventListener('click', () => {
+        serverModal.classList.remove('show');
+        // 恢复原始高度
+        document.body.style.minHeight = '';
+    });
 
     // Prevent clicks on modal background from closing the popup
     serverModal.addEventListener('mousedown', (e) => {
@@ -430,8 +506,13 @@ document.addEventListener('DOMContentLoaded', () => {
 
         saveConfig();
         serverModal.classList.remove('show');
+        // 恢复原始高度
+        document.body.style.minHeight = '';
         renderServerList();
         renderCurrentServer();
+
+        // 保存服务器后重新检测连接状态
+        testServerConnection(config.servers.find(s => s.id === config.activeServerId));
     });
 
     // 更新规则信息（显示已启用规则源的总规则数）
@@ -541,6 +622,8 @@ document.addEventListener('DOMContentLoaded', () => {
         importStatus.textContent = '';
         importStatus.style.color = '#888';
         ruleSourceModal.classList.add('show');
+        // 撑开背景高度以适应弹窗
+        document.body.style.minHeight = '580px';
     });
 
     // 打开编辑规则源弹窗
@@ -555,9 +638,15 @@ document.addEventListener('DOMContentLoaded', () => {
         importStatus.textContent = source.rules ? `已导入 ${source.rules.length} 条规则` : '';
         importStatus.style.color = '#888';
         ruleSourceModal.classList.add('show');
+        // 撑开背景高度以适应弹窗
+        document.body.style.minHeight = '580px';
     }
 
-    closeRuleSourceModal.addEventListener('click', () => ruleSourceModal.classList.remove('show'));
+    closeRuleSourceModal.addEventListener('click', () => {
+        ruleSourceModal.classList.remove('show');
+        // 恢复原始高度
+        document.body.style.minHeight = '';
+    });
 
     // Prevent clicks on modal background from closing the popup
     ruleSourceModal.addEventListener('mousedown', (e) => {
@@ -692,25 +781,7 @@ document.addEventListener('DOMContentLoaded', () => {
     // Base64 解码
     function base64Decode(str) {
         try {
-            const cleanStr = str.replace(/\s/g, '');
-            const chars = 'ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789+/';
-            let result = [];
-            let i = 0;
-
-            while (i < cleanStr.length) {
-                const c1 = chars.indexOf(cleanStr[i++]);
-                const c2 = chars.indexOf(cleanStr[i++]);
-                const c3 = chars.indexOf(cleanStr[i++]);
-                const c4 = chars.indexOf(cleanStr[i++]);
-
-                const bits = (c1 << 18) | (c2 << 12) | (c3 << 6) | c4;
-
-                result.push((bits >> 16) & 0xFF);
-                if (c3 !== 64) result.push((bits >> 8) & 0xFF);
-                if (c4 !== 64) result.push(bits & 0xFF);
-            }
-
-            return new TextDecoder().decode(new Uint8Array(result));
+            return atob(str.replace(/\s/g, ''));
         } catch (e) {
             return null;
         }
@@ -766,6 +837,8 @@ document.addEventListener('DOMContentLoaded', () => {
         config.lastUpdate = new Date().toISOString();
         saveConfig();
         ruleSourceModal.classList.remove('show');
+        // 恢复原始高度
+        document.body.style.minHeight = '';
         renderRuleSources();
         updateRulesInfo();
     });

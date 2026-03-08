@@ -1,7 +1,7 @@
 // JP Proxy - Background Service Worker
 
 // Version information
-const EXTENSION_VERSION = '1.0.1';
+const EXTENSION_VERSION = '1.0.2';
 const GITHUB_REPO = 'OT512/Proxy-Extension';
 const VERSION_CHECK_URL = `https://raw.githubusercontent.com/${GITHUB_REPO}/main/manifest.json`;
 const RELEASES_URL = `https://github.com/${GITHUB_REPO}/releases`;
@@ -94,7 +94,18 @@ async function fetchAndSaveRules() {
 
 // Internal function to fetch and save rules
 async function doFetchAndSave() {
-    const response = await fetch(RULES_URL);
+    // SW fetch() bypasses chrome.proxy settings, manually add Proxy-Authorization
+    // to prevent browser from showing auth dialog when in global proxy mode
+    const cfg = cachedConfig || await Storage.getConfig();
+    const srv = cfg?.servers?.find(s => s.id === cfg.activeServerId) || cfg?.servers?.[0];
+
+    const headers = {};
+    if (srv?.username) {
+        headers['Proxy-Authorization'] = `Basic ${btoa(`${srv.username}:${srv.password || ''}`)}`;
+        console.log('doFetchAndSave: adding Proxy-Authorization for user:', srv.username);
+    }
+
+    const response = await fetch(RULES_URL, { headers });
     if (!response.ok) throw new Error(`HTTP ${response.status}`);
     const text = await response.text();
     const rules = parseRules(text);
@@ -159,7 +170,9 @@ const PORT_BACKUP = 8443;
 function forceReauth(config) {
     console.log('forceReauth: switching port to bypass browser auth cache...');
 
-    const server = config.servers.find(s => s.id === config.activeServerId) || config.servers[0];
+    // Deep clone to avoid mutating cachedConfig or the caller's object
+    const newConfig = JSON.parse(JSON.stringify(config));
+    const server = newConfig.servers.find(s => s.id === newConfig.activeServerId) || newConfig.servers[0];
     if (!server) {
         console.error('No active server for forceReauth');
         updateProxy(config);
@@ -172,7 +185,7 @@ function forceReauth(config) {
 
     console.log('Switching port:', currentPort, '->', newPort);
 
-    // Update server port
+    // Update server port on cloned config
     server.port = newPort;
 
     // Clear PAC cache since port changed
@@ -182,13 +195,12 @@ function forceReauth(config) {
     // First set direct mode to clear proxy state
     chrome.proxy.settings.set({
         value: { mode: 'direct' },
-        scope: 'regular'
+        scope: 'regular_only'
     }, () => {
-        // Save config with new port
-        chrome.storage.local.set({ config }, () => {
+        // Save cloned config with new port
+        chrome.storage.local.set({ config: newConfig }, () => {
             console.log('Config saved with new port:', newPort);
-            // Update proxy with new port
-            updateProxy(config);
+            updateProxy(newConfig);
         });
     });
 }
@@ -203,7 +215,7 @@ function getActiveServer(config) {
 
 // 更新代理设置
 function updateProxy(config) {
-    console.log('updateProxy called, mode:', config.proxyMode, 'enabled:', config.enabled);
+    console.log('[PROXY] updateProxy called, mode:', config.proxyMode, 'enabled:', config.enabled, 'port:', config.servers?.[0]?.port);
 
     // Always update badge based on enabled state
     updateBadge(config.enabled);
@@ -211,7 +223,7 @@ function updateProxy(config) {
     if (!config.enabled || config.servers.length === 0) {
         chrome.proxy.settings.set({
             value: { mode: 'direct' },
-            scope: 'regular'
+            scope: 'regular_only'
         }, () => {
             console.log('Proxy disabled');
         });
@@ -238,17 +250,15 @@ function updateProxy(config) {
                 bypassList: ['localhost', '127.0.0.1', '192.168.*', '10.*', '172.16.*', '::1', '<local>']
             }
         };
-        chrome.proxy.settings.set({ value: proxyConfig, scope: 'regular' }, () => {
+        chrome.proxy.settings.set({ value: proxyConfig, scope: 'regular_only' }, () => {
             console.log('Proxy mode: all ->', server.host + ':' + server.port);
-            updateBadge(true);
         });
     } else if (config.proxyMode === 'bypass') {
         chrome.proxy.settings.set({
             value: { mode: 'direct' },
-            scope: 'regular'
+            scope: 'regular_only'
         }, () => {
             console.log('Proxy mode: bypass (direct)');
-            updateBadge(true);
         });
     } else if (config.proxyMode === 'rules') {
         const pacScript = generatePacScript(config, server);
@@ -258,10 +268,9 @@ function updateProxy(config) {
                 mode: 'pac_script',
                 pacScript: { data: pacScript }
             },
-            scope: 'regular'
+            scope: 'regular_only'
         }, () => {
             console.log('Proxy mode: rules (PAC)');
-            updateBadge(true);
         });
     }
 }
@@ -379,25 +388,18 @@ function updateBadge(enabled) {
     chrome.action.setIcon({ path: iconPath });
 }
 
-// Handle proxy auth - async to handle SW wake-up (cachedConfig may be null)
+// Handle proxy auth - must be synchronous in MV3 (asyncBlocking not supported)
+// cachedConfig is pre-populated by initConfig() on SW startup
+console.log('[AUTH] onAuthRequired listener registered');
 chrome.webRequest.onAuthRequired.addListener(
-    async (details) => {
-        console.log('onAuthRequired called for:', details.url);
+    (details) => {
+        console.log('[AUTH] onAuthRequired triggered, isProxy:', details.isProxy, 'cachedConfig:', !!cachedConfig);
 
-        // Try memory cache first
-        let config = cachedConfig;
-
-        // If cache is empty (SW woke up), read from storage
-        if (!config) {
-            console.log('Cache miss, reading from storage...');
-            config = await Storage.getConfig();
-            cachedConfig = config; // Repopulate cache
-        }
-
-        if (config && config.servers) {
-            const server = config.servers.find(s => s.id === config.activeServerId) || config.servers[0];
-            if (server && server.username) {
-                console.log('Providing auth for user:', server.username);
+        if (cachedConfig?.servers) {
+            const server = cachedConfig.servers.find(s => s.id === cachedConfig.activeServerId)
+                || cachedConfig.servers[0];
+            if (server?.username) {
+                console.log('[AUTH] Providing credentials for user:', server.username, 'port:', server.port);
                 return {
                     authCredentials: {
                         username: server.username,
@@ -405,12 +407,16 @@ chrome.webRequest.onAuthRequired.addListener(
                     }
                 };
             }
+            console.log('[AUTH] Server found but no username');
+        } else {
+            console.log('[AUTH] No cachedConfig or no servers');
         }
-        console.log('No auth provided, canceling');
+
+        console.log('[AUTH] No credentials provided');
         return { cancel: false };
     },
     { urls: ['<all_urls>'] },
-    ['asyncBlocking']
+    ['blocking']
 );
 
 // Note: onBeforeSendHeaders with blocking mode requires webRequestBlocking permission
@@ -472,8 +478,15 @@ chrome.runtime.onMessage.addListener((message, sender, sendResponse) => {
     if (message.action === 'fetchRules') {
         console.log('Fetching URL:', message.url);
 
-        // Try fetch without CORS mode (Service Worker can bypass CORS)
-        fetch(message.url)
+        // SW fetch() bypasses chrome.proxy, must add Proxy-Authorization manually
+        const fetchHeaders = {};
+        const activeSrv = cachedConfig?.servers?.find(s => s.id === cachedConfig.activeServerId)
+            || cachedConfig?.servers?.[0];
+        if (activeSrv?.username) {
+            fetchHeaders['Proxy-Authorization'] = `Basic ${btoa(`${activeSrv.username}:${activeSrv.password || ''}`)}`;
+        }
+
+        fetch(message.url, { headers: fetchHeaders })
             .then(r => {
                 console.log('Fetch response status:', r.status);
                 if (!r.ok) {
@@ -555,6 +568,7 @@ async function testServerConnection(server) {
             ws.onerror = () => {
                 // For HTTPS proxies, this is expected - server doesn't speak WebSocket
                 // But we got a response, which means TCP connection was established
+                // Suppress the error by not logging it
                 if (!resolved) {
                     resolved = true;
                     clearTimeout(timeout);
@@ -587,7 +601,6 @@ async function testServerConnection(server) {
 
     } catch (error) {
         const latency = Date.now() - startTime;
-        console.error('Server test error:', error);
 
         // DNS resolution failed - invalid hostname
         if (error.message && (
@@ -621,15 +634,25 @@ async function testServerConnection(server) {
 }
 
 // Initialize on Service Worker wake-up
+// Store as a promise so onAuthRequired can await it if cache is not ready
+let initConfigPromise = null;
+
 function initConfig() {
-    chrome.storage.local.get(['config'], (result) => {
-        cachedConfig = result.config || createDefaultConfig();
-        updateProxy(cachedConfig);
+    initConfigPromise = new Promise((resolve) => {
+        chrome.storage.local.get(['config'], (result) => {
+            cachedConfig = result.config || createDefaultConfig();
+            updateProxy(cachedConfig);
+            resolve(cachedConfig);
+        });
     });
+    return initConfigPromise;
 }
 
-// Execute immediately on script load (covers Service Worker wake-up)
-initConfig();
+// Immediately set direct mode on SW startup to prevent browser from using stale
+// proxy settings before SW is ready, which would trigger auth dialog on new tabs
+chrome.proxy.settings.set({ value: { mode: 'direct' }, scope: 'regular_only' }, () => {
+    initConfig(); // Then restore correct proxy settings from storage
+});
 
 // Check for updates on startup and periodically
 // Only check if 24 hours have passed since last check
@@ -650,45 +673,49 @@ shouldCheckUpdate().then(shouldCheck => {
         console.log('Skipping update check, checked within 24 hours');
     }
 });
-setInterval(async () => {
-    if (await shouldCheckUpdate()) {
+
+// Use chrome.alarms instead of setInterval - alarms survive SW sleep
+chrome.alarms.create('updateCheck', { periodInMinutes: 60 });
+chrome.alarms.onAlarm.addListener(async (alarm) => {
+    if (alarm.name === 'updateCheck' && await shouldCheckUpdate()) {
         checkForUpdates();
     }
-}, 60 * 60 * 1000); // Check every hour, but only run if 24h passed
+});
 
 // Check for new version on GitHub
 async function checkForUpdates() {
     try {
-        // Record check time
         await chrome.storage.local.set({ lastUpdateCheck: new Date().toISOString() });
 
-        // First, test if the update URL is reachable (with a short timeout)
-        const testController = new AbortController();
-        const testTimeout = setTimeout(() => testController.abort(), 5000);
+        const cfg = cachedConfig || await Storage.getConfig();
+        const srv = cfg?.servers?.find(s => s.id === cfg.activeServerId) || cfg?.servers?.[0];
+        const headers = {};
+        if (srv?.username) {
+            headers['Proxy-Authorization'] = `Basic ${btoa(`${srv.username}:${srv.password || ''}`)}`;
+        }
 
+        const controller = new AbortController();
+        const timeout = setTimeout(() => controller.abort(), 5000);
+
+        let response;
         try {
-            const testResponse = await fetch(VERSION_CHECK_URL, {
-                method: 'HEAD',
+            response = await fetch(VERSION_CHECK_URL, {
                 cache: 'no-cache',
-                signal: testController.signal
+                signal: controller.signal,
+                headers
             });
-            clearTimeout(testTimeout);
-
-            // If not reachable, silently skip update check
-            if (!testResponse.ok) {
-                console.log('Update server not reachable, skipping update check');
-                return;
-            }
-        } catch (testError) {
-            clearTimeout(testTimeout);
-            // Network error or timeout - silently skip update check
+        } catch {
+            // Network error or timeout - silently skip, no console error
+            clearTimeout(timeout);
             console.log('Update server unreachable, skipping update check');
             return;
         }
+        clearTimeout(timeout);
 
-        // Server is reachable, now fetch the actual version info
-        const response = await fetch(VERSION_CHECK_URL, { cache: 'no-cache' });
-        if (!response.ok) return;
+        if (!response.ok) {
+            console.log('Update server not reachable, skipping update check');
+            return;
+        }
 
         const manifest = await response.json();
         const latestVersion = manifest.version;
@@ -697,8 +724,6 @@ async function checkForUpdates() {
 
         if (compareVersions(latestVersion, EXTENSION_VERSION) > 0) {
             console.log('New version available:', latestVersion);
-
-            // Store update info
             chrome.storage.local.set({
                 updateAvailable: {
                     currentVersion: EXTENSION_VERSION,
@@ -707,15 +732,11 @@ async function checkForUpdates() {
                     checkedAt: new Date().toISOString()
                 }
             });
-
-            // Show notification
             showUpdateNotification(latestVersion);
         } else {
-            // Clear update info if up to date
             chrome.storage.local.remove(['updateAvailable']);
         }
     } catch (error) {
-        // Silently fail - don't log error for update checks
         console.log('Update check skipped:', error.message);
     }
 }
@@ -734,6 +755,11 @@ function compareVersions(a, b) {
     return 0;
 }
 
+// Open release page when update notification is clicked (registered once at top level)
+chrome.notifications.onClicked.addListener(() => {
+    chrome.tabs.create({ url: RELEASES_URL });
+});
+
 // Show update notification
 function showUpdateNotification(version) {
     chrome.notifications.create({
@@ -743,11 +769,6 @@ function showUpdateNotification(version) {
         message: `新版本 ${version} 已发布，点击下载`,
         priority: 2,
         requireInteraction: true
-    });
-
-    // Open release page on click
-    chrome.notifications.onClicked.addListener(() => {
-        chrome.tabs.create({ url: RELEASES_URL });
     });
 }
 
