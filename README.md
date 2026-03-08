@@ -33,7 +33,7 @@ browser-proxy-extension/
 
 ## ✨ 功能特性
 
-- **多种代理协议**: 支持 HTTP、HTTPS、SOCKS5 代理（推荐 HTTPS 以获得 TLS 加密）
+- **TLS 加密代理**: 仅支持 TLS 加密的 HTTPS 代理，不支持 HTTP/SOCKS5
 - **三种代理模式**:
   - 全局模式：所有流量走代理
   - 智能模式：基于规则分流
@@ -64,9 +64,12 @@ browser-proxy-extension/
 3. 点击「+ 添加服务器」
 4. 填写服务器信息：
    - 名称：自定义名称
-   - 协议：HTTP/HTTPS/SOCKS5
-   - 地址：服务器 IP 或域名
-   - 用户名/密码：（可选）认证信息
+   - 协议：仅支持 HTTPS（TLS 加密）
+   - 地址：服务器域名（需配置 TLS 证书）
+   - 端口：443 或其他 TLS 端口
+   - 用户名/密码：认证信息
+
+> **重要提示**：本插件仅支持 TLS 加密的 HTTPS 代理，服务器端必须配置有效的 TLS 证书。不支持 HTTP 和 SOCKS5 协议。
 
 ### 导入规则
 
@@ -371,11 +374,11 @@ browser-proxy-extension/
     {
       id: 1,
       name: "Server Name",
-      type: "https",           // http | https | socks5
+      type: "https",           // 仅支持 https（TLS 加密）
       host: "proxy.example.com",
       port: 443,
-      username: "user",        // 可选
-      password: "pass"         // 可选
+      username: "user",
+      password: "pass"
     }
   ],
   activeServerId: 1,           // 当前活动服务器 ID
