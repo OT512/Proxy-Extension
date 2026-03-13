@@ -33,7 +33,7 @@ browser-proxy-extension/
 
 ## ✨ 功能特性
 
-- **TLS 加密代理**: 仅支持 TLS 加密的 HTTPS 代理，不支持 HTTP/SOCKS5
+- **TLS 加密代理**: 代理连接走 TLS 加密通道，实际代理协议（HTTP/HTTPS/SOCKS5）取决于服务器端配置
 - **三种代理模式**:
   - 全局模式：所有流量走代理
   - 智能模式：基于规则分流
