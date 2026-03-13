@@ -30,7 +30,6 @@ document.addEventListener('DOMContentLoaded', () => {
     let editingServerId = null;
     let editingRuleSourceId = null;
     let importedRules = null; // 临时存储导入的规则
-
     // Toast notification
     function showToast(message, type = 'info') {
         let toast = document.querySelector('.toast');
@@ -95,24 +94,23 @@ document.addEventListener('DOMContentLoaded', () => {
         });
     }
 
-    function getDefaultConfig() {
-        return {
-            enabled: false,
-            servers: [],
-            activeServerId: null,
-            proxyMode: 'rules',
-            rules: [],
-            lastUpdate: null,
-            ruleSources: []
-        };
-    }
+    // Default config — mirrors createDefaultConfig() in background.js
+    const DEFAULT_CONFIG = {
+        enabled: false,
+        servers: [],
+        activeServerId: null,
+        proxyMode: 'rules',
+        rules: [],
+        lastUpdate: null,
+        ruleSources: []
+    };
+    function getDefaultConfig() { return JSON.parse(JSON.stringify(DEFAULT_CONFIG)); }
 
     function saveConfig() {
         chrome.storage.local.set({ config });
     }
 
     function updateUI() {
-        updateStatus(config.enabled);
         enableToggleHeader.checked = config.enabled;
         modeOptions.forEach(opt => {
             opt.classList.toggle('active', opt.dataset.mode === config.proxyMode);
@@ -132,57 +130,62 @@ document.addEventListener('DOMContentLoaded', () => {
         }
     }
 
-    // 检测服务器连接状态（单次检测）
+    // 监听 background 推送的实时代理状态（真实流量监控结果）
+    chrome.runtime.onMessage.addListener((message) => {
+        if (message.action === 'proxyStatusChanged') {
+            const server = config?.servers?.find(s => s.id === config.activeServerId);
+            if (server && message.serverId === server.id) {
+                serverStatusCache[server.id] = { status: message.status, latency: message.latency || null };
+                renderCurrentServer();
+            }
+        }
+    });
+
+    let isTesting = false;  // prevent concurrent test requests
+
     async function testServerConnection(server) {
         if (!server) return;
+        if (isTesting) return;  // already testing, ignore
+        isTesting = true;
+
+        serverStatusCache[server.id] = { status: 'checking' };
+        renderCurrentServer();
 
         try {
-            const response = await new Promise((resolve, reject) => {
-                chrome.runtime.sendMessage(
-                    { action: 'testServer', server: server },
-                    (res) => {
-                        if (chrome.runtime.lastError) {
-                            reject(new Error(chrome.runtime.lastError.message));
-                        } else {
-                            resolve(res);
-                        }
+            await new Promise((resolve) => {
+                chrome.runtime.sendMessage({ action: 'testServer', server }, (res) => {
+                    if (chrome.runtime.lastError || !res) {
+                        serverStatusCache[server.id] = { status: 'fail', latency: null };
+                    } else if (res.status === 'busy') {
+                        // Another test is already running — keep 'checking' state, don't overwrite
+                    } else {
+                        const statusObj = { status: res.status, latency: res.latency || null };
+                        serverStatusCache[server.id] = statusObj;
                     }
-                );
+                    renderCurrentServer();
+                    resolve();
+                });
             });
-
-            if (response && response.success) {
-                serverStatusCache[server.id] = { status: 'success', latency: response.latency };
-            } else {
-                const errorMsg = response?.error || '';
-                const isAuthFail = errorMsg.includes('407') || errorMsg.includes('auth') || errorMsg.includes('credentials');
-                serverStatusCache[server.id] = { status: isAuthFail ? 'auth-fail' : 'fail', latency: null };
-            }
-        } catch (error) {
-            const errorMsg = error.message || '';
-            const isAuthFail = errorMsg.includes('407') || errorMsg.includes('auth') || errorMsg.includes('credentials');
-            serverStatusCache[server.id] = { status: isAuthFail ? 'auth-fail' : 'fail', latency: null };
+        } finally {
+            isTesting = false;
         }
-
-        // 更新当前服务器显示
-        renderCurrentServer();
     }
 
-    // 自动检测当前服务器连接状态（入口函数）
+    // 从 session storage 恢复流量监控状态（background 写入，popup 读取展示）
     async function autoTestCurrentServer() {
         const server = config.servers.find(s => s.id === config.activeServerId);
         if (!server) return;
-
-        // 如果已有状态（成功或失败），不再重复检测
-        if (serverStatusCache[server.id]) return;
-
-        // 执行单次检测
-        await testServerConnection(server);
+        if (serverStatusCache[server.id]) { renderCurrentServer(); return; }
+        try {
+            const stored = await chrome.storage.session.get(['proxyStatus']);
+            const ps = stored.proxyStatus;
+            if (ps && ps.serverId === server.id) {
+                serverStatusCache[server.id] = { status: ps.status, latency: ps.latency || null };
+                renderCurrentServer();
+            }
+        } catch (_) {}
     }
 
-    function updateStatus(enabled) {
-        // Status is now shown via the toggle switch in header
-        // No separate status dot/text needed
-    }
 
     // 标签切换
     tabs.forEach(tab => {
@@ -197,7 +200,6 @@ document.addEventListener('DOMContentLoaded', () => {
     // 启用/禁用代理
     enableToggleHeader.addEventListener('change', () => {
         config.enabled = enableToggleHeader.checked;
-        updateStatus(config.enabled);
         saveConfig();
         // 更新当前服务器状态显示
         renderCurrentServer();
@@ -213,30 +215,24 @@ document.addEventListener('DOMContentLoaded', () => {
         });
     });
 
-    // 服务器状态缓存  { status: 'success'|'fail'|'auth-fail'|'unknown', latency, connStatus }
+    // 服务器状态缓存 { status: 'success'|'fail'|'auth-fail'|'checking', latency }
     const serverStatusCache = {};
 
-    // 返回状态徽章 HTML（基于服务器认证状态和扩展启用状态）
+    // 返回连接状态徽章 HTML
+    // 当前服务器条目的自动认证状态（来自真实流量监控，非主动测试）
     function connStatusBadge(serverId) {
-        // 扩展关闭时显示已断开
-        if (!config.enabled) {
-            return '<span class="conn-status disconnected">已断开</span>';
-        }
+        if (!config.enabled) return '<span class="conn-status disconnected">已禁用</span>';
         const s = serverStatusCache[serverId];
-        if (!s) return '<span class="conn-status disconnected">未检测</span>';
-        if (s.status === 'success') return '<span class="conn-status connected">已连接</span>';
-        if (s.status === 'auth-fail') return '<span class="conn-status auth-fail">认证失败</span>';
+        if (!s) return '<span class="conn-status disconnected">未知</span>';
+        if (s.status === 'checking') return '<span class="conn-status testing">检测中...</span>';
+        if (s.status === 'success') {
+            const ping = s.latency ? ` <span class="ping-value">${s.latency}ms</span>` : '';
+            return `<span class="conn-status connected">代理正常</span>${ping}`;
+        }
+        if (s.status === 'auth-fail') return '<span class="conn-status auth-fail">密码错误</span>';
+        if (s.status === 'timeout') return '<span class="conn-status disconnected">连接超时</span>';
         if (s.status === 'fail') return '<span class="conn-status disconnected">连接失败</span>';
-        return '<span class="conn-status disconnected">未检测</span>';
-    }
-
-    // 返回延迟显示 HTML（只显示延迟，与状态无关）
-    function latencyBadge(serverId) {
-        const s = serverStatusCache[serverId];
-        if (s && s.latency) {
-            return `<span class="test-result success" style="display:inline;">${s.latency}ms</span>`;
-        }
-        return '';
+        return '<span class="conn-status disconnected">未知</span>';
     }
 
     // 渲染服务器列表
@@ -249,11 +245,11 @@ document.addEventListener('DOMContentLoaded', () => {
                 <div class="radio"></div>
                 <div class="server-info">
                     <div class="server-name">${server.name}<span class="test-result" style="display:none;"></span></div>
-                    <div class="server-detail">${server.type.toUpperCase()} - ${server.host}</div>
+                    <div class="server-detail">${server.type.toUpperCase()} - ${server.host}:${server.port}</div>
                     <div class="test-progress"></div>
                 </div>
                 <div class="server-actions">
-                    <button class="btn-icon test" data-id="${server.id}" title="测试连接">⚡</button>
+                    <button class="btn-icon test" data-id="${server.id}" title="检测可达">⚡</button>
                     <button class="btn-icon edit" data-id="${server.id}" title="编辑">✎</button>
                     <button class="btn-icon delete" data-id="${server.id}" title="删除">✕</button>
                 </div>
@@ -300,95 +296,49 @@ document.addEventListener('DOMContentLoaded', () => {
         });
     }
 
-    // 测试服务器连接
+    // 测试服务器：统一走 background testServer，根据 authStatus 显示结果
     async function testServer(server, item) {
         const testBtn = item.querySelector('.btn-icon.test');
         const testResult = item.querySelector('.test-result');
-        const testProgress = item.querySelector('.test-progress');
 
-        // 检查是否是当前服务器行（没有测试按钮）
-        const isCurrentServerRow = !testBtn;
-
-        // 重置状态
         item.classList.remove('test-success', 'test-fail');
         item.classList.add('testing');
         if (testResult) testResult.style.display = 'none';
-        if (testBtn) {
-            testBtn.disabled = true;
-            testBtn.textContent = '...';
-        }
+        if (testBtn) { testBtn.disabled = true; testBtn.textContent = '...'; }
+
+        serverStatusCache[server.id] = { status: 'checking' };
+        renderCurrentServer();
 
         const startTime = Date.now();
-        let testSuccess = false;
-        let testLatency = null;
-        let testError = null;
+        await testServerConnection(server);
+        await new Promise(r => setTimeout(r, Math.max(0, 1500 - (Date.now() - startTime))));
 
-        try {
-            // 发送测试请求到 background
-            const response = await new Promise((resolve, reject) => {
-                chrome.runtime.sendMessage(
-                    { action: 'testServer', server: server },
-                    (res) => {
-                        if (chrome.runtime.lastError) {
-                            reject(new Error(chrome.runtime.lastError.message));
-                        } else {
-                            resolve(res);
-                        }
-                    }
-                );
-            });
-
-            testLatency = Date.now() - startTime;
-
-            if (response && response.success) {
-                testSuccess = true;
-                serverStatusCache[server.id] = { status: 'success', latency: testLatency };
-            } else {
-                throw new Error(response?.error || '连接失败');
-            }
-        } catch (error) {
-            testSuccess = false;
-            testError = error.message;
-            // Detect auth failure (407 = wrong credentials)
-            const isAuthFail = testError && (testError.includes('407') || testError.includes('auth') || testError.includes('credentials'));
-            serverStatusCache[server.id] = { status: isAuthFail ? 'auth-fail' : 'fail', latency: null };
-        }
-
-        // 等待进度条动画完成（2秒）再显示结果
-        const elapsed = Date.now() - startTime;
-        const animationDuration = 2000;
-        const remainingTime = Math.max(0, animationDuration - elapsed);
-
-        await new Promise(resolve => setTimeout(resolve, remainingTime));
-
-        // 显示结果
         item.classList.remove('testing');
+        const cached = serverStatusCache[server.id];
 
-        if (testSuccess) {
+        if (cached.status === 'success') {
             item.classList.add('test-success');
+            showToast(`${server.name} 服务器在线${cached.latency ? ' (' + cached.latency + 'ms)' : ''}`, 'success');
             if (testResult) {
-                testResult.textContent = `${testLatency}ms`;
+                testResult.textContent = cached.latency ? `${cached.latency}ms` : 'OK';
                 testResult.className = 'test-result success';
                 testResult.style.display = 'inline';
             }
-            showToast(`${server.name} 连接成功 (${testLatency}ms)`, 'success');
+        } else if (cached.status === 'auth-fail') {
+            item.classList.add('test-fail');
+            showToast(`${server.name} 用户名/密码错误`, 'error');
+            if (testResult) { testResult.textContent = '鉴权失败'; testResult.className = 'test-result fail'; testResult.style.display = 'inline'; }
+        } else if (cached.status === 'timeout') {
+            item.classList.add('test-fail');
+            showToast(`${server.name} 连接超时`, 'error');
+            if (testResult) { testResult.textContent = '超时'; testResult.className = 'test-result fail'; testResult.style.display = 'inline'; }
         } else {
             item.classList.add('test-fail');
-            if (testResult) {
-                testResult.textContent = '失败';
-                testResult.className = 'test-result fail';
-                testResult.style.display = 'inline';
-            }
-            showToast(`${server.name} 连接失败: ${testError}`, 'error');
+            showToast(`${server.name} 服务器不可达`, 'error');
+            if (testResult) { testResult.textContent = '失败'; testResult.className = 'test-result fail'; testResult.style.display = 'inline'; }
         }
 
-        // 恢复按钮状态
-        if (testBtn) {
-            testBtn.disabled = false;
-            testBtn.textContent = '⚡';
-        }
-
-        // Refresh currentServer panel to update connection status badge
+        if (testBtn) { testBtn.disabled = false; testBtn.textContent = '⚡'; }
         renderCurrentServer();
     }
 
@@ -397,22 +347,12 @@ document.addEventListener('DOMContentLoaded', () => {
         const server = config.servers.find(s => s.id === config.activeServerId);
         if (server) {
             currentServerDiv.innerHTML = `
-                <div class="server-item active" style="position: relative; cursor: pointer;">
+                <div class="server-item active" style="position: relative;">
                     <div class="server-info">
                         <div class="server-name">${server.name}${connStatusBadge(server.id)}</div>
-                        <div class="test-progress"></div>
-                    </div>
-                    <div class="server-actions">
-                        ${latencyBadge(server.id)}
                     </div>
                 </div>
             `;
-
-            const item = currentServerDiv.querySelector('.server-item');
-            // 点击整个条目触发测速
-            item.addEventListener('click', async () => {
-                await testServer(server, item);
-            });
         }
     }
 
@@ -433,6 +373,7 @@ document.addEventListener('DOMContentLoaded', () => {
         document.getElementById('serverName').value = server.name;
         document.getElementById('serverType').value = server.type;
         document.getElementById('serverHost').value = server.host;
+        document.getElementById('serverPort').value = server.port || 443;
         document.getElementById('serverUsername').value = server.username || '';
         document.getElementById('serverPassword').value = server.password || '';
         serverModal.classList.add('show');
@@ -470,6 +411,7 @@ document.addEventListener('DOMContentLoaded', () => {
         document.getElementById('serverName').value = '';
         document.getElementById('serverType').value = 'https';
         document.getElementById('serverHost').value = '';
+        document.getElementById('serverPort').value = '443';
         document.getElementById('serverUsername').value = '';
         document.getElementById('serverPassword').value = '';
     }
@@ -479,6 +421,7 @@ document.addEventListener('DOMContentLoaded', () => {
         const name = document.getElementById('serverName').value.trim();
         const type = document.getElementById('serverType').value;
         const host = document.getElementById('serverHost').value.trim();
+        const port = parseInt(document.getElementById('serverPort').value, 10);
         const username = document.getElementById('serverUsername').value.trim();
         const password = document.getElementById('serverPassword').value;
 
@@ -486,21 +429,32 @@ document.addEventListener('DOMContentLoaded', () => {
             showToast('请填写服务器名称和地址', 'error');
             return;
         }
+        if (!port || port < 1 || port > 65535) {
+            showToast('请填写有效的端口号（1-65535）', 'error');
+            return;
+        }
 
+        let credChanged = false;
         if (editingServerId) {
             const server = config.servers.find(s => s.id === editingServerId);
             if (server) {
+                credChanged = server.username !== username ||
+                              server.password !== password ||
+                              server.host !== host ||
+                              server.port !== port;
                 server.name = name;
                 server.type = type;
                 server.host = host;
+                server.port = port;
                 server.username = username;
                 server.password = password;
-                // Port is managed automatically (443/8443 switching)
+                if (credChanged) delete serverStatusCache[server.id];
             }
         } else {
+            credChanged = true;
             const newId = Math.max(...config.servers.map(s => s.id), 0) + 1;
             // Default port is 443, will be switched automatically when credentials change
-            config.servers.push({ id: newId, name, type, host, port: 443, username, password });
+            config.servers.push({ id: newId, name, type, host, port, username, password });
             config.activeServerId = newId;
         }
 
@@ -511,8 +465,18 @@ document.addEventListener('DOMContentLoaded', () => {
         renderServerList();
         renderCurrentServer();
 
-        // 保存服务器后重新检测连接状态
-        testServerConnection(config.servers.find(s => s.id === config.activeServerId));
+        // 如果凭据或地址有变化，提示用户重启浏览器以清除代理认证缓存
+        if (credChanged) {
+            showToast('设置已保存。如代理未立即生效，请重启浏览器', 'info');
+        }
+
+        // 保存服务器后立即检测鉴权状态
+        const saved = config.servers.find(s => s.id === config.activeServerId);
+        if (saved) {
+            serverStatusCache[saved.id] = { status: 'checking' };
+            renderCurrentServer();
+            testServerConnection(saved);
+        }
     });
 
     // 更新规则信息（显示已启用规则源的总规则数）
@@ -686,9 +650,13 @@ document.addEventListener('DOMContentLoaded', () => {
         try {
             let rules;
             if (content) {
-                // 直接从粘贴的内容解析
-                rules = parseRules(content);
-                console.log('Parsed from content:', rules.length);
+                // 通过 background 解析（复用 background 的 parseRules 逻辑）
+                rules = await new Promise((resolve, reject) => {
+                    chrome.runtime.sendMessage({ action: 'importRules', content }, (res) => {
+                        if (chrome.runtime.lastError || !res?.success) reject(new Error(res?.error || '解析失败'));
+                        else resolve(res.rules);
+                    });
+                });
             } else {
                 // 从URL获取
                 rules = await fetchRules(url);
@@ -740,52 +708,6 @@ document.addEventListener('DOMContentLoaded', () => {
         });
     }
 
-    // 解析规则文件（支持 Base64 编码）
-    function parseRules(text) {
-        let content = text.trim();
-
-        // 尝试 Base64 解码
-        try {
-            const cleanContent = content.replace(/\s/g, '');
-            if (/^[A-Za-z0-9+/=]+$/.test(cleanContent) && cleanContent.length > 100) {
-                const decoded = base64Decode(cleanContent);
-                if (decoded) content = decoded;
-            }
-        } catch (e) { }
-
-        const lines = content.split('\n');
-        const rules = [];
-
-        for (const line of lines) {
-            const trimmed = line.trim();
-            if (!trimmed || trimmed.startsWith('!') || trimmed.startsWith('#') || trimmed.startsWith('[')) {
-                continue;
-            }
-            if (trimmed.startsWith('||')) {
-                rules.push(trimmed);
-            } else if (trimmed.startsWith('|')) {
-                const match = trimmed.match(/\|https?:\/\/([^\/\|]+)/);
-                if (match) rules.push('||' + match[1]);
-            } else if (trimmed.startsWith('.')) {
-                rules.push('*' + trimmed);
-            } else if (trimmed.startsWith('@')) {
-                continue;
-            } else if (trimmed.includes('.') && !trimmed.startsWith('/')) {
-                rules.push(trimmed);
-            }
-        }
-
-        return rules;
-    }
-
-    // Base64 解码
-    function base64Decode(str) {
-        try {
-            return atob(str.replace(/\s/g, ''));
-        } catch (e) {
-            return null;
-        }
-    }
 
     // 保存规则源
     saveRuleSourceBtn.addEventListener('click', () => {
@@ -858,42 +780,66 @@ document.addEventListener('DOMContentLoaded', () => {
         }
     });
 
-    // Version check and update notification
-    const versionInfo = document.getElementById('versionInfo');
-    const updateNotice = document.getElementById('updateNotice');
-
-    // Get version from background
-    chrome.runtime.sendMessage({ action: 'getVersion' }, (response) => {
-        if (response && response.version) {
-            versionInfo.textContent = `OT512 Proxy v${response.version}`;
-        }
-    });
-
-    // Check for update availability
-    chrome.storage.local.get(['updateAvailable'], (result) => {
-        if (result.updateAvailable) {
-            showUpdateNotice(result.updateAvailable);
-        }
-    });
-
-    // Listen for storage changes (update notification)
-    chrome.storage.onChanged.addListener((changes, namespace) => {
-        if (namespace === 'local' && changes.updateAvailable) {
-            if (changes.updateAvailable.newValue) {
-                showUpdateNotice(changes.updateAvailable.newValue);
-            } else {
-                updateNotice.style.display = 'none';
+    // 导入默认 GFWList
+    const importGFWListBtn = document.getElementById('importGFWListBtn');
+    if (importGFWListBtn) {
+        importGFWListBtn.addEventListener('click', async () => {
+            if (!config.enabled) {
+                showToast('请先启用代理', 'error');
+                return;
             }
-        }
-    });
+            const server = config.servers.find(s => s.id === config.activeServerId);
+            if (!server) {
+                showToast('请先添加服务器', 'error');
+                return;
+            }
+            const origText = importGFWListBtn.textContent;
+            importGFWListBtn.disabled = true;
+            importGFWListBtn.textContent = '导入中...';
+            showToast('正在下载 GFWList...', 'info');
 
-    function showUpdateNotice(updateInfo) {
-        updateNotice.style.display = 'inline';
-        updateNotice.textContent = `🔄 v${updateInfo.latestVersion}`;
-        updateNotice.title = `点击下载新版本 v${updateInfo.latestVersion}`;
+            chrome.runtime.sendMessage({ action: 'importDefaultGFWList' }, (response) => {
+                importGFWListBtn.disabled = false;
+                importGFWListBtn.textContent = origText;
+                if (chrome.runtime.lastError) {
+                    showToast('导入失败: ' + chrome.runtime.lastError.message, 'error');
+                    return;
+                }
+                if (response && response.success) {
+                    showToast(`GFWList 导入成功 (${response.count} 条规则)，已切换智能分流`, 'success');
+                    // Reload config from storage to reflect changes made by background
+                    loadConfig();
+                } else {
+                    showToast('导入失败: ' + (response?.error || '未知错误'), 'error');
+                }
+            });
+        });
+    }
 
-        updateNotice.onclick = () => {
-            chrome.tabs.create({ url: `https://github.com/OT512/Proxy-Extension/releases` });
-        };
+    // Version badge (GitHub style) — version pulled from background
+    const versionBadge = document.getElementById('versionBadge');
+    const ghBadgeRight = document.getElementById('ghBadgeRight');
+    if (versionBadge) {
+        // Get version from background (single source of truth: EXTENSION_VERSION)
+        chrome.runtime.sendMessage({ action: 'getVersion' }, (res) => {
+            if (res?.version && ghBadgeRight) {
+                ghBadgeRight.textContent = `v${res.version}`;
+            }
+        });
+        chrome.storage.local.get(['updateAvailable'], (result) => {
+            if (result.updateAvailable) versionBadge.classList.add('has-update');
+        });
+        chrome.storage.onChanged.addListener((changes, namespace) => {
+            if (namespace === 'local' && changes.updateAvailable) {
+                versionBadge.classList.toggle('has-update', !!changes.updateAvailable.newValue);
+            }
+        });
+        versionBadge.addEventListener('click', (e) => {
+            e.preventDefault();
+            chrome.runtime.sendMessage({ action: 'getVersion' }, (res) => {
+                const repo = res?.githubRepo;
+                if (repo) chrome.tabs.create({ url: `https://github.com/${repo}` });
+            });
+        });
     }
 });
